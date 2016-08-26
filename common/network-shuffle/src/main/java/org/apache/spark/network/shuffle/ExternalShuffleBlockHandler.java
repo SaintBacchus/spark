@@ -31,12 +31,17 @@ import com.codahale.metrics.MetricSet;
 import com.codahale.metrics.Timer;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.Lists;
+
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.Unpooled;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import org.apache.spark.network.buffer.ManagedBuffer;
 import org.apache.spark.network.client.RpcResponseCallback;
 import org.apache.spark.network.client.TransportClient;
+import org.apache.spark.network.protocol.Encoders;
 import org.apache.spark.network.server.OneForOneStreamManager;
 import org.apache.spark.network.server.RpcHandler;
 import org.apache.spark.network.server.StreamManager;
@@ -125,7 +130,15 @@ public class ExternalShuffleBlockHandler extends RpcHandler {
       } finally {
         responseDelayContext.stop();
       }
-
+    } else if (msgObj instanceof CleanShuffle) {
+      CleanShuffle msg = (CleanShuffle) msgObj;
+      String appId = msg.appId;
+      String userName = msg.userName;
+      String[] ids = blockManager.cleanEmptyBlockDirs(appId, userName, msg.toRemoveExecutorId);
+      blockManager.shuffleLocalDirClean(appId, msg.shuffleId, userName);
+      ByteBuf buf = Unpooled.buffer(Encoders.StringArrays.encodedLength(ids));
+      Encoders.StringArrays.encode(buf, ids);
+      callback.onSuccess(ByteBuffer.wrap(buf.array()));
     } else {
       throw new UnsupportedOperationException("Unexpected message: " + msgObj);
     }

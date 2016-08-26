@@ -21,10 +21,17 @@ import java.lang.ref.{ReferenceQueue, WeakReference}
 import java.util.concurrent.{ConcurrentLinkedQueue, ScheduledExecutorService, TimeUnit}
 
 import scala.collection.JavaConverters._
+import scala.collection.mutable
+
+import _root_.io.netty.buffer.Unpooled
 
 import org.apache.spark.broadcast.Broadcast
 import org.apache.spark.internal.Logging
+import org.apache.spark.network.netty.SparkTransportConf
+import org.apache.spark.network.protocol.Encoders
+import org.apache.spark.network.shuffle.ExternalShuffleClient
 import org.apache.spark.rdd.{RDD, ReliableRDDCheckpointData}
+import org.apache.spark.scheduler.cluster.CoarseGrainedSchedulerBackend
 import org.apache.spark.util.{AccumulatorContext, AccumulatorV2, ThreadUtils, Utils}
 
 /**
@@ -107,6 +114,14 @@ private[spark] class ContextCleaner(sc: SparkContext) extends Logging {
     "spark.cleaner.referenceTracking.blocking.shuffle", false)
 
   @volatile private var stopped = false
+
+  private val shuffleCleanEnable = sc.conf.getBoolean("spark.dynamicAllocation.enabled", false) &&
+    sc.taskScheduler.isInstanceOf[CoarseGrainedSchedulerBackend]
+  private val shuffleCleaner: Option[ShuffleCleaner] = if (shuffleCleanEnable) {
+    Some(new ShuffleCleaner(sc))
+  } else {
+    None
+  }
 
   /** Attach a listener object to get information of when objects are cleaned. */
   def attachListener(listener: CleanerListener): Unit = {
@@ -216,8 +231,12 @@ private[spark] class ContextCleaner(sc: SparkContext) extends Logging {
   def doCleanupShuffle(shuffleId: Int, blocking: Boolean): Unit = {
     try {
       logDebug("Cleaning shuffle " + shuffleId)
-      mapOutputTrackerMaster.unregisterShuffle(shuffleId)
-      blockManagerMaster.removeShuffle(shuffleId, blocking)
+      if (shuffleCleanEnable) {
+        shuffleCleaner.foreach(_.doShuffleClean(shuffleId.toString))
+      } else {
+        mapOutputTrackerMaster.unregisterShuffle(shuffleId)
+        blockManagerMaster.removeShuffle(shuffleId, blocking)
+      }
       listeners.asScala.foreach(_.shuffleCleaned(shuffleId))
       logInfo("Cleaned shuffle " + shuffleId)
     } catch {
@@ -283,4 +302,35 @@ private[spark] trait CleanerListener {
   def broadcastCleaned(broadcastId: Long): Unit
   def accumCleaned(accId: Long): Unit
   def checkpointCleaned(rddId: Long): Unit
+}
+
+private[spark] class ShuffleCleaner(sc: SparkContext) extends Logging {
+  private[spark] val shuffleClient = {
+    val transConf = SparkTransportConf.fromSparkConf(sc.conf, "ShuffleCleaner")
+    val sm = SparkEnv.get.securityManager
+    new ExternalShuffleClient(transConf,
+      sm, sm.isAuthenticationEnabled(), sm.isSaslEncryptionEnabled())
+  }
+  shuffleClient.init(sc.applicationId)
+  val scheduleBackend = sc.schedulerBackend.asInstanceOf[CoarseGrainedSchedulerBackend]
+
+  private val user = sc.sparkUser
+
+  private val externalShuffleServicePort =
+    Utils.getSparkOrYarnConfig(sc.conf, "spark.shuffle.service.port", "7337").toInt
+
+  def doShuffleClean(shuffleId: String): Unit = {
+    val toRemoveExecutorId = scheduleBackend.removedExecutorId
+    val removedExecutorId = new mutable.HashSet[String]()
+    val hosts = scheduleBackend.usedHosts.toIterator
+    for (host <- hosts) {
+      val exIds = shuffleClient.doShuffleClean(host, externalShuffleServicePort, shuffleId,
+        user, toRemoveExecutorId.toArray)
+      for(id <- Encoders.StringArrays.decode(Unpooled.copiedBuffer(exIds))) {
+        removedExecutorId += id
+      }
+    }
+
+    removedExecutorId.foreach(toRemoveExecutorId.remove)
+  }
 }

@@ -33,6 +33,7 @@ public class BlockTransferMessagesSuite {
     checkSerializeDeserialize(new UploadBlock("app-1", "exec-2", "block-3", new byte[] { 1, 2 },
       new byte[] { 4, 5, 6, 7} ));
     checkSerializeDeserialize(new StreamHandle(12345, 16));
+    checkSerializeDeserialize(new CleanShuffle("app-1", "1", "spark", new String[]{"1"}));
   }
 
   private void checkSerializeDeserialize(BlockTransferMessage msg) {

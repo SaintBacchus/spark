@@ -19,9 +19,12 @@ package org.apache.spark.network.util;
 
 import java.io.Closeable;
 import java.io.File;
+import java.io.FilenameFilter;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -151,6 +154,99 @@ public class JavaUtils {
 
     if (exitCode != 0 || file.exists()) {
       throw new IOException("Failed to delete: " + file.getAbsolutePath());
+    }
+  }
+
+  /**
+   * Check the block manager local dir whether is a empty dir or not.
+   * @param file block manager file dir.
+   * @return Only a total empty dir returns true, otherwise return false.
+   * @throws IOException
+   */
+  public static Boolean checkEmptyDir(File file)  throws IOException {
+    if (file == null) {
+      return false;
+    }
+    // First level is disk manager local dirs.
+    if (!file.getName().startsWith("blockmgr")) {
+      return false;
+    }
+    if (file.isDirectory() && !isSymlink(file)) {
+      // Second level it the default 64 sub dir.
+      for (File child : listFilesSafely(file)) {
+        // If there are some strange files in local dir, we should leave the file and wait to
+        // find out what actually it is.
+        if (child.isDirectory()) {
+          // Same with local dir: when there are any files, don't delete the dir.
+          for (File f : child.listFiles()) {
+            if (f.getName().startsWith("shuffle_")) {
+              return false;
+            }
+          }
+        } else {
+          return false;
+        }
+      }
+    }
+    return true;
+  }
+
+  /**
+   * Delete all the shuffle files in directory with specific shuffle id.
+   * Make sure this directory is blockmgr's local dir.
+   * Don't follow directories if they are symlinks.
+   * Throws an exception if deletion is unsuccessful.
+   */
+  public static List<File> getShuffleFiles(String shuffleId, File file) throws IOException {
+    List<File> shuffleFileList = new ArrayList<File>();
+
+    if (file == null) { return shuffleFileList; }
+
+    // First level is disk manager local dirs.
+    if (!file.getName().startsWith("blockmgr")) {
+      logger.warn("File name should be block manager's local dirs, ignore this action.");
+      return shuffleFileList;
+    }
+
+    logger.debug("Try to delete shuffle files in " + file.getCanonicalPath());
+
+    if (file.isDirectory() && !isSymlink(file)) {
+      IOException savedIOException = null;
+
+      // Second level it the default 64 sub dir.
+      for (File child : listFilesSafely(file)) {
+        try {
+          for (File childShuffleFile : listShuffleFiles(shuffleId, child)) {
+            // Third level should be the shuffle file(not a dir).
+            // Use `deleteRecursively` only for reusing code.
+            shuffleFileList.add(childShuffleFile);
+          }
+        } catch (IOException e) {
+          // In case of multiple exceptions, only last one will be thrown
+          savedIOException = e;
+        }
+      }
+      if (savedIOException != null) {
+        throw savedIOException;
+      }
+    }
+    return shuffleFileList;
+  }
+
+  private static File[] listShuffleFiles(final String shuffleId, File file) throws IOException {
+    if (file.exists()) {
+      final File[] files = file.listFiles(new FilenameFilter() {
+        @Override
+        public boolean accept(File dir, String name) {
+          return name.startsWith("shuffle_" + shuffleId + "_");
+        }
+      });
+      if (files == null) {
+        throw new IOException("Failed to list files for dir: " + file);
+      }
+      return files;
+    } else {
+      return new File[0];
     }
   }
 

@@ -23,6 +23,7 @@ import java.util.List;
 
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
+import org.apache.spark.network.shuffle.protocol.CleanShuffle;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -142,6 +143,21 @@ public class ExternalShuffleClient extends ShuffleClient {
     try {
       ByteBuffer registerMessage = new RegisterExecutor(appId, execId, executorInfo).toByteBuffer();
       client.sendRpcSync(registerMessage, 5000 /* timeoutMs */);
+    } finally {
+      client.close();
+    }
+  }
+
+  public ByteBuffer doShuffleClean(
+      String host,
+      int port,
+      String shuffleId,
+      String user, String[] ids) throws IOException {
+    checkInit();
+    TransportClient client = clientFactory.createUnmanagedClient(host, port);
+    try {
+      ByteBuffer cleanShuffle = new CleanShuffle(appId, shuffleId, user, ids).toByteBuffer();
+      return client.sendRpcSync(cleanShuffle, 5000 /* timeoutMs */);
     } finally {
       client.close();
     }

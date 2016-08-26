@@ -18,6 +18,7 @@
 package org.apache.spark.network.shuffle;
 
 import java.io.*;
+import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
 import java.util.concurrent.ConcurrentMap;
@@ -80,6 +81,10 @@ public class ExternalShuffleBlockResolver {
   private final Executor directoryCleaner;
 
   private final TransportConf conf;
+
+  private Object deleteService;
+  private Class<?> deleteServiceClass;
+  private Method deleteServiceMethod;
 
   @VisibleForTesting
   final File registeredExecutorFile;
@@ -163,6 +168,18 @@ public class ExternalShuffleBlockResolver {
       executors = Maps.newConcurrentMap();
     }
     this.directoryCleaner = directoryCleaner;
+
+    try {
+      deleteServiceClass = Class.forName("org.apache.spark.network.yarn.util.FileDeletionServer");
+      deleteServiceMethod = deleteServiceClass.getMethod("deleteFile", String.class, File.class);
+      deleteService = (Object)deleteServiceClass.newInstance();
+    } catch (Throwable e) {
+      logger.warn("This is not in YARN mode," +
+        " so ShuffleService should have the same user of spark executor.");
+      deleteService = null;
+      deleteServiceClass = null;
+      deleteServiceMethod = null;
+    }
   }
 
   public int getRegisteredExecutorsSize() {
@@ -295,6 +312,114 @@ public class ExternalShuffleBlockResolver {
         shuffleIndexRecord.getLength());
     } catch (ExecutionException e) {
       throw new RuntimeException("Failed to open file: " + indexFile, e);
+    }
+  }
+
+  /**
+   * Clean up the block manger local dirs for the specific executors if the dir has none files.
+   * @param appId id of the application
+   * @param userName user who has the right to delete this file, default with user who submit
+   *                 the spark application or configuration by
+   *                 `yarn.nodemanager.linux-container-executor.user`
+   * @param ids executor ids to clean up their local dirs.
+   * @return an array of the executor ids which will be passed to tell Application Master
+   *         that these executor's block manger local dirs had been clean up.
+   */
+  public String[] cleanEmptyBlockDirs(String appId, final String userName, String[] ids) {
+    List<String> removeList = new ArrayList<String>();
+    Set<String> toRemovedExecutors = new HashSet<String>(Arrays.asList(ids));
+    Iterator<Map.Entry<AppExecId, ExecutorShuffleInfo>> it = executors.entrySet().iterator();
+    while (it.hasNext()) {
+      Map.Entry<AppExecId, ExecutorShuffleInfo> entry = it.next();
+      AppExecId fullId = entry.getKey();
+      final ExecutorShuffleInfo executor = entry.getValue();
+
+      if (appId.equals(fullId.appId) && toRemovedExecutors.contains(fullId.execId)) {
+        if (checkEmptyBlockDir(executor.localDirs)) {
+          removeList.add(fullId.execId);
+          directoryCleaner.execute(new Runnable() {
+            @Override
+            public void run() {
+              for (String localDir: executor.localDirs) {
+                deleteShuffleSpecFile(userName, new File(localDir));
+              }
+            }
+          });
+        }
+      }
+    }
+    return removeList.toArray(new String[removeList.size()]);
+  }
+
+  private boolean checkEmptyBlockDir(String[] dirs) {
+    try {
+      for (String localDir : dirs) {
+        if (!JavaUtils.checkEmptyDir(new File(localDir))) {
+          return false;
+        }
+      }
+    } catch (IOException e) {
+      logger.error("Error in checkEmptyBlockDir: " + e);
+      return false;
+    }
+    return true;
+  }
+
+  private void deleteShuffleSpecFile(String userName, File file) {
+    if (null == deleteServiceClass || null == deleteServiceMethod || null == deleteService) {
+      try {
+        JavaUtils.deleteRecursively(file);
+        logger.debug("Successfully cleaned up directory: {}", file.getCanonicalPath());
+      } catch (Exception e) {
+        logger.error("Failed to delete directory: ", e);
+      }
+    } else {
+      try {
+        deleteServiceMethod.invoke(deleteService, userName, file);
+      } catch (Exception e) {
+        logger.error("Error when call the deleteService: " + e);
+      }
+    }
+  }
+
+  public void shuffleLocalDirClean(String appId, final String shuffleId, final String userName) {
+    logger.info("AppId {}'s shuffle({}) removed with userName {}.", appId, shuffleId, userName);
+    Iterator<Map.Entry<AppExecId, ExecutorShuffleInfo>> it = executors.entrySet().iterator();
+    while (it.hasNext()) {
+      Map.Entry<AppExecId, ExecutorShuffleInfo> entry = it.next();
+      AppExecId fullId = entry.getKey();
+      final ExecutorShuffleInfo executor = entry.getValue();
+
+      // Only touch executors associated with the appId that was removed.
+      if (appId.equals(fullId.appId)) {
+        // Execute the actual deletion in a different thread, as it may take some time.
+        directoryCleaner.execute(new Runnable() {
+          @Override
+          public void run() {
+            deleteShuffleDirs(shuffleId, executor.localDirs, userName);
+          }
+        });
+      }
+    }
+  }
+
+  /**
+   * Synchronously deletes each directory's shuffle files one at a time.
+   * Should be executed in its own thread, as this may take a long time.
+   */
+  private void deleteShuffleDirs(String shuffleId, String[] dirs, String userName) {
+    for (String localDir : dirs) {
+      try {
+        List<File> filesToDelete = JavaUtils.getShuffleFiles(shuffleId, new File(localDir));
+        for (File file: filesToDelete) {
+          deleteShuffleSpecFile(userName, file);
+        }
+        logger.debug("Successfully cleaned up shuffle file with id {} in directory: {} ",
+          shuffleId, localDir);
+      } catch (Exception e) {
+        logger.error("Failed to delete shuffle file with id {" + shuffleId + "} in directory: "
+          + localDir, e);
+      }
     }
   }
 

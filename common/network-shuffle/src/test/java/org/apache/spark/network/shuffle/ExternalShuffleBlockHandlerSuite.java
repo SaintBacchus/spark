@@ -36,12 +36,7 @@ import org.apache.spark.network.client.RpcResponseCallback;
 import org.apache.spark.network.client.TransportClient;
 import org.apache.spark.network.server.OneForOneStreamManager;
 import org.apache.spark.network.server.RpcHandler;
-import org.apache.spark.network.shuffle.protocol.BlockTransferMessage;
-import org.apache.spark.network.shuffle.protocol.ExecutorShuffleInfo;
-import org.apache.spark.network.shuffle.protocol.OpenBlocks;
-import org.apache.spark.network.shuffle.protocol.RegisterExecutor;
-import org.apache.spark.network.shuffle.protocol.StreamHandle;
-import org.apache.spark.network.shuffle.protocol.UploadBlock;
+import org.apache.spark.network.shuffle.protocol.*;
 
 public class ExternalShuffleBlockHandlerSuite {
   TransportClient client = mock(TransportClient.class);
@@ -74,6 +69,21 @@ public class ExternalShuffleBlockHandlerSuite {
         .getMetrics()
         .get("registerExecutorRequestLatencyMillis");
     assertEquals(1, registerExecutorRequestLatencyMillis.getCount());
+  }
+
+  @Test
+  public void testShuffleCleaner() {
+    RpcResponseCallback callback = mock(RpcResponseCallback.class);
+    when(blockResolver.cleanEmptyBlockDirs("app0", "spark", new String[]{"1"}))
+            .thenReturn(new String[0]);
+
+    ByteBuffer cleaner = new CleanShuffle("app0", "1", "spark", new String[]{"1"}).toByteBuffer();
+    handler.receive(client, cleaner, callback);
+    verify(blockResolver, times(1)).shuffleLocalDirClean("app0", "1", "spark");
+    verify(blockResolver, times(1)).cleanEmptyBlockDirs("app0", "spark", new String[]{"1"});
+
+    verify(callback, times(1)).onSuccess(any(ByteBuffer.class));
+    verify(callback, never()).onFailure(any(Throwable.class));
   }
 
   @SuppressWarnings("unchecked")
